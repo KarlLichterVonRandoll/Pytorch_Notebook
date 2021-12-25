@@ -15,6 +15,16 @@ from IPython import display
 import matplotlib.pyplot as plt
 from torch import nn
 from torch.nn import init
+import time
+import torch.nn.functional as F
+
+
+class GlobalAvgPool2d(nn.Module):
+    # 全局平均池化层可通过将池化窗口形状设置成输入的高和宽实现
+    def __init__(self):
+        super(GlobalAvgPool2d, self).__init__()
+    def forward(self, x):
+        return F.avg_pool2d(x, kernel_size=x.size()[2:])
 
 
 # 用矢量图显示
@@ -70,28 +80,44 @@ def show_fashion_mnist(images, labels):
     
 
 # 加载fashion_mnist数据集
-def load_data_fashion_mnist(batch_size, root='~/Datasets/FashionMNIST'):
+def load_data_fashion_mnist(batch_size, resize=None, root="../../Datasets/FashionMNIST/"):
     """Download the fashion mnist dataset and then load into memory."""
-    transform = transforms.ToTensor()
+    trans = []
+    if resize:
+        trans.append(torchvision.transforms.Resize(size=resize))
+    trans.append(torchvision.transforms.ToTensor())
+    
+    transform = torchvision.transforms.Compose(trans)
     mnist_train = torchvision.datasets.FashionMNIST(root=root, train=True, download=True, transform=transform)
     mnist_test = torchvision.datasets.FashionMNIST(root=root, train=False, download=True, transform=transform)
-    if sys.platform.startswith('win'):
-        num_workers = 0
-    else:
-        num_workers = 4
-    train_iter = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    test_iter = torch.utils.data.DataLoader(mnist_test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    train_iter = torch.utils.data.DataLoader(mnist_train, batch_size=batch_size, shuffle=True, num_workers=1)
+    test_iter = torch.utils.data.DataLoader(mnist_test, batch_size=batch_size, shuffle=False, num_workers=1)
     
     return train_iter, test_iter
 
 
 # 类似的评价一下模型net在数据集data_iter上的准确率
-def evaluate_accuracy(data_iter, net):
+def evaluate_accuracy(data_iter, net, device=None):
+    if device is None and isinstance(net, torch.nn.Module):
+        # 如果没有指定device就使用net的device
+        device = list(net.parameters())[0].device
     acc_sum, n = 0.0, 0
-    for X, y in data_iter:
-        acc_sum += (net(X).argmax(dim=1)==y).float().sum().item()
-        n += y.shape[0]
-    return acc_sum / n
+    with torch.no_grad():
+        for X, y in data_iter:
+            if isinstance(net, torch.nn.Module):
+                net.eval()  # 评估模式，这会关闭dropout
+                acc_sum += (net(X.to(device)).argmax(dim=1) == y.to(device)).float().sum().cpu().item()
+                net.train()  # 改回训练模式
+            else: # 自定义的模型, 3.13节之后不会用到, 不考虑GPU
+                if('is_training' in net.__code__.co_varnames): # 如果有is_training这个参数
+                    # 将is_training设置成False
+                    acc_sum += (net(X, is_training=False).argmax(dim=1) == y).float().sum().item() 
+                else:
+                    acc_sum += (net(X).argmax(dim=1) == y).float().sum().item()
+            n += y.shape[0]
+            
+        return acc_sum / n
 
 
 # 随机梯度下降函数更新梯度
@@ -131,6 +157,29 @@ def train_ch3(net, train_iter, test_iter, loss, num_epochs, batch_size,
         print('epoch %d, loss %.4f, train acc %.3f, test acc %.3f'
               % (epoch + 1, train_l_sum / n, train_acc_sum / n, test_acc))
         
+# 本函数已保存在d2lzh_pytorch包中方便以后使用
+def train_ch5(net, train_iter, test_iter, batch_size, optimizer, device, num_epochs):
+    net = net.to(device)
+    print("training on ", device)
+    loss = torch.nn.CrossEntropyLoss()
+    for epoch in range(num_epochs):
+        train_l_sum, train_acc_sum, n, batch_count, start = 0.0, 0.0, 0, 0, time.time()
+        for X, y in train_iter:
+            X = X.to(device)
+            y = y.to(device)
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            optimizer.zero_grad()
+            l.backward()
+            optimizer.step()
+            train_l_sum += l.cpu().item()
+            train_acc_sum += (y_hat.argmax(dim=1) == y).sum().cpu().item()
+            n += y.shape[0]
+            batch_count += 1
+        test_acc = evaluate_accuracy(test_iter, net)
+        print("epoch %d, loss %.4f, train acc %.3f, test acc %.3f, time %.1f sec"
+              % (epoch + 1, train_l_sum / batch_count, train_acc_sum / n, test_acc, time.time() - start))
+        
 # 定义一个FlattenLayer实现对 x 的形状转换功能
 class FlattenLayer(nn.Module):
     def __init__(self):
@@ -138,5 +187,25 @@ class FlattenLayer(nn.Module):
     
     def forward(self, x): # x shape:(batch, *, *, ...)
         return x.view(x.shape[0], -1)
-        
+    
+    
+def semilogy(x_vals, y_vals, x_label, y_label, x2_vals=None, y2_vals=None, 
+             legend=None, figsize=(3.5, 2.5)):
+    set_figsize(figsize)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.semilogy(x_vals, y_vals)
+    if x2_vals and y2_vals:
+        plt.semilogy(x2_vals, y2_vals, linestyle=':')
+        plt.legend(legend)
+
+
+def corr2d(X, K): # 二维卷积运算
+    h, w = K.shape
+    Y = torch.zeros((X.shape[0] - h + 1, X.shape[1] - w + 1))
+    for i in range(Y.shape[0]):
+        for j in range(Y.shape[1]):
+            Y[i, j] = (X[i: i + h, j: j + w] * K).sum()  # 模拟二维互相关运算
+            
+    return Y        
         
